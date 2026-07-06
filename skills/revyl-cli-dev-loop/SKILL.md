@@ -184,7 +184,9 @@ with `revyl dev stop <context>`, and start a fresh loop with the launch vars.
    `Error:` before the ready line, stop and report the error to the user.
 4. **Device commands in a separate terminal** -- `revyl device tap`,
    `screenshot`, `type`, and `swipe` are short-lived. Run them in a
-   different Shell call, not the dev-loop terminal.
+   different Shell call, not the dev-loop terminal. When running two or more
+   device actions in a row, collapse them into one `revyl device batch` call
+   (JSON steps, compact JSONL output) instead of separate commands.
 5. **Do not interact with TTY prompts** -- the dev loop prints
    `[r] rebuild native + reinstall` and `[q] quit`. These require a real
    TTY. In agent shells, use `revyl dev rebuild`, `revyl dev stop`, or restart

@@ -216,6 +216,26 @@ revyl device start --platform ios
 # Want hot reload? Run: revyl dev attach active
 ```
 
+Multiple sessions and batched actions (recommended for coding agents -- one
+invocation instead of many, compact JSON output):
+
+```bash
+revyl device start --platform ios,android --json   # start both in parallel
+revyl device start --platform ios --count 2 --json # two iOS sessions
+revyl device list --json                           # indices for -s targeting
+
+revyl device batch --steps '[
+  {"action":"tap","target":"Sign In"},
+  {"action":"type","target":"email field","text":"user@example.com"},
+  {"action":"screenshot","s":1,"out":"android.png"}
+]'
+```
+
+Each batch step is one action (`tap`, `type`, `swipe`, `key`, `wait`,
+`screenshot`, `hierarchy`, ...) and may set `"s"` to route to a specific
+session index. Output is one compact JSON line per step plus a summary. See
+`revyl device batch --help` for the full action list.
+
 ### Builds and Dev Mode
 
 All `revyl build` and `revyl build upload` commands push to a shared app container (the `app_id` in your config). Each upload is tagged with your git branch and commit via metadata.

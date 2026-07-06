@@ -502,6 +502,8 @@ var deviceStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start a device session",
 	Example: `  revyl device start --platform ios
+  revyl device start --platform ios,android --json    # two sessions in parallel
+  revyl device start --platform ios --count 2 --json  # two iOS sessions
   revyl device start --platform android --timeout 600
   revyl device start --platform ios --launch-var API_URL --launch-var DEBUG
   revyl device start --platform ios --json`,
@@ -556,10 +558,19 @@ var deviceStartCmd = &cobra.Command{
 			}
 		}
 
-		platform, err = normalizeDeviceStartPlatform(platform)
-		if err != nil {
-			return err
+		count, _ := cmd.Flags().GetInt("count")
+		if count < 1 {
+			count = 1
 		}
+		platforms := strings.Split(platform, ",")
+		for i := range platforms {
+			platforms[i], err = normalizeDeviceStartPlatform(strings.TrimSpace(platforms[i]))
+			if err != nil {
+				return err
+			}
+		}
+		platform = platforms[0]
+		multiStart := len(platforms)*count > 1
 		if !cmd.Flags().Changed("timeout") {
 			cwd, cwdErr := os.Getwd()
 			if cwdErr == nil {
@@ -578,6 +589,10 @@ var deviceStartCmd = &cobra.Command{
 		deviceModelFlag, _ := cmd.Flags().GetString("device-model")
 		osVersionFlag, _ := cmd.Flags().GetString("os-version")
 
+		if multiStart && (deviceNameFlag != "" || deviceSelectFlag) {
+			return fmt.Errorf("--device and --device-name are not supported when starting multiple sessions; use --device-model/--os-version")
+		}
+
 		var selectedDeviceModel, selectedOsVersion string
 		if deviceNameFlag != "" {
 			presetPlatform, presetModel, presetRuntime, presetErr := targetCatalog.ResolvePreset(deviceNameFlag)
@@ -591,8 +606,10 @@ var deviceStartCmd = &cobra.Command{
 			if deviceModelFlag == "" || osVersionFlag == "" {
 				return fmt.Errorf("--device-model and --os-version must both be provided")
 			}
-			if err := targetCatalog.ValidateDevicePair(platform, deviceModelFlag, osVersionFlag); err != nil {
-				return err
+			for _, p := range platforms {
+				if err := targetCatalog.ValidateDevicePair(p, deviceModelFlag, osVersionFlag); err != nil {
+					return err
+				}
 			}
 			selectedDeviceModel = deviceModelFlag
 			selectedOsVersion = osVersionFlag
@@ -667,6 +684,10 @@ var deviceStartCmd = &cobra.Command{
 			IdleTimeout:        time.Duration(timeout) * time.Second,
 			DeviceModel:        selectedDeviceModel,
 			OsVersion:          selectedOsVersion,
+		}
+
+		if multiStart {
+			return runMultiDeviceStart(ctx, mgr, platforms, count, startOpts, jsonOutput, cmd.OutOrStdout())
 		}
 
 		var session *mcppkg.DeviceSession
@@ -2838,7 +2859,8 @@ func init() {
 	}
 
 	// Start
-	deviceStartCmd.Flags().String("platform", "", "Platform: ios or android (inferred from --app-id/--build-version-id when omitted, defaults to ios)")
+	deviceStartCmd.Flags().String("platform", "", "Platform: ios or android, or a comma-separated list to start multiple sessions (inferred from --app-id/--build-version-id when omitted, defaults to ios)")
+	deviceStartCmd.Flags().Int("count", 1, "Number of sessions to start per platform (started in parallel)")
 	deviceStartCmd.Flags().Int("timeout", 300, "Idle timeout in seconds")
 	deviceStartCmd.Flags().Bool("open", true, "Open viewer in browser after device is ready")
 	deviceStartCmd.Flags().String("app-id", "", "App ID to resolve latest build from")

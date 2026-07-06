@@ -326,9 +326,9 @@ func (m *DeviceSessionManager) StartSession(
 	ctx context.Context,
 	opts StartSessionOptions,
 ) (int, *DeviceSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// Provisioning (backend start + worker polling) runs without the lock so
+	// multiple sessions can be started concurrently; the lock is taken only
+	// for the commit phase below where shared state is mutated.
 	platform := strings.ToLower(strings.TrimSpace(opts.Platform))
 	if platform != "ios" && platform != "android" {
 		return -1, nil, fmt.Errorf("platform must be 'ios' or 'android'")
@@ -471,6 +471,9 @@ func (m *DeviceSessionManager) StartSession(
 		// the session so the agent can retry or diagnose, but log a warning.
 		// The session is usable; the device may connect shortly after.
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	sessionID := m.backendSessionIDByWorkflowRunLocked(ctx, workflowRunID)
 	appURL := config.GetAppURL(m.devMode)

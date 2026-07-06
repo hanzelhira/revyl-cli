@@ -27,6 +27,39 @@ Use this as the default Revyl skill when workflows should be expressed as `revyl
 1. Prefer explicit command sequences.
 2. Keep secrets in env vars or test variables.
 3. Keep steps deterministic and avoid hidden assumptions.
+4. Minimize round trips: when running 2+ device actions in a row, use one
+   `revyl device batch` call instead of separate `tap`/`type`/`swipe`
+   commands, and pass `--json` on device commands for compact output.
+
+## Token-Efficient Device Control
+
+Batch consecutive device actions into a single invocation. Steps are a JSON
+array (or JSON Lines); output is one compact JSON line per step plus a
+summary:
+
+```bash
+revyl device batch --steps '[
+  {"action":"tap","target":"Sign In"},
+  {"action":"type","target":"email field","text":"user@example.com"},
+  {"action":"key","key":"ENTER"},
+  {"action":"screenshot","out":"after-login.png"}
+]'
+```
+
+Supported actions: tap, double_tap, long_press, type, clear_text, swipe,
+drag, pinch, key, wait, back, home, shake, kill_app, launch, open_app,
+screenshot, hierarchy. Each step accepts `"s": <index>` to target a specific
+session, so one batch can drive several devices. Add `--continue-on-error`
+to run all steps regardless of failures.
+
+Start multiple device sessions in one parallel call, then address them with
+`-s <index>` (or per-step `"s"` in a batch):
+
+```bash
+revyl device start --platform ios,android --json   # one session per platform
+revyl device start --platform ios --count 2 --json # two iOS sessions
+revyl device list --json                           # session indices and state
+```
 
 ## Baseline Checks
 

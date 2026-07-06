@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1850,5 +1853,89 @@ func TestDeviceSessionManager_CancelStepBestEffort_BoundedByBudget(t *testing.T)
 	// Must have polled at least once for terminal status before giving up.
 	if statusCalls < 1 {
 		t.Fatalf("expected at least one post-cancel status poll, got %d", statusCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestDeviceSessionManager_StartSession_Concurrent: Verify that provisioning
+// runs outside the manager lock so multiple sessions start in parallel, and
+// that commit still assigns unique indices.
+// ---------------------------------------------------------------------------
+
+func TestDeviceSessionManager_StartSession_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	var startCalls atomic.Int32
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/execution/start_device":
+			cur := inFlight.Add(1)
+			for {
+				prev := maxInFlight.Load()
+				if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			time.Sleep(150 * time.Millisecond)
+			inFlight.Add(-1)
+			n := startCalls.Add(1)
+			runID := fmt.Sprintf("99999999-9999-9999-9999-99999999999%d", n)
+			_, _ = w.Write([]byte(`{"workflow_run_id":"` + runID + `"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/execution/streaming/worker-connection/"):
+			runID := strings.TrimPrefix(r.URL.Path, "/api/v1/execution/streaming/worker-connection/")
+			_, _ = w.Write([]byte(`{"status":"ready","workflow_run_id":"` + runID + `","worker_ws_url":"ws://` + r.Host + `/ws/stream?token=test"}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/health"):
+			_, _ = w.Write([]byte(`{"status":"ok","device_connected":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: -1,
+	}
+
+	var wg sync.WaitGroup
+	indices := make(chan int, 2)
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			idx, _, err := mgr.StartSession(context.Background(), StartSessionOptions{Platform: "ios"})
+			if err != nil {
+				errs <- err
+				return
+			}
+			indices <- idx
+		}()
+	}
+	wg.Wait()
+	close(indices)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	seen := map[int]bool{}
+	for idx := range indices {
+		if seen[idx] {
+			t.Fatalf("duplicate session index %d", idx)
+		}
+		seen[idx] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(seen))
+	}
+	if maxInFlight.Load() < 2 {
+		t.Errorf("start_device calls did not overlap (max in-flight %d); provisioning may be serialized again", maxInFlight.Load())
 	}
 }

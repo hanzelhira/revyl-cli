@@ -2154,3 +2154,63 @@ func TestDeviceSessionManager_SyncSessions_PreservesLabel(t *testing.T) {
 		t.Fatalf("unexpected session after sync: %+v", s)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestDeviceSessionManager_SyncSessions_GracePeriodForPendingSessionID:
+// A freshly committed session whose backend session ID hasn't materialized
+// yet (empty SessionID) must survive a sync instead of being pruned; a stale
+// one without an ID is still cleaned up.
+// ---------------------------------------------------------------------------
+
+func TestDeviceSessionManager_SyncSessions_GracePeriodForPendingSessionID(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/entity/users/get_user_uuid":
+			_, _ = w.Write([]byte(`{"user_id":"u1","org_id":"org-1","email":"me@example.com","concurrency_limit":10}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/execution/device-sessions/active"):
+			// Backend list is lagging: reports no sessions at all.
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   2,
+	}
+	// Young session, ID still pending: must survive.
+	mgr.sessions[0] = &DeviceSession{
+		Index: 0, SessionID: "", WorkflowRunID: "wf-young", Label: "web-c",
+		WorkerBaseURL: "http://localhost:1", Platform: "ios",
+		StartedAt: now.Add(-10 * time.Second), LastActivity: now,
+	}
+	// Stale session without an ID: pruned as before.
+	mgr.sessions[1] = &DeviceSession{
+		Index: 1, SessionID: "", WorkflowRunID: "wf-old",
+		WorkerBaseURL: "http://localhost:1", Platform: "ios",
+		StartedAt: now.Add(-10 * time.Minute), LastActivity: now.Add(-10 * time.Minute),
+	}
+
+	if err := mgr.SyncSessions(context.Background()); err != nil {
+		t.Fatalf("SyncSessions: %v", err)
+	}
+
+	if _, ok := mgr.sessions[0]; !ok {
+		t.Fatal("young pending-ID session was pruned; grace period not applied")
+	}
+	if s, err := mgr.ResolveSessionRef("web-c"); err != nil || s.Index != 0 {
+		t.Fatalf("label lost on pending-ID session: %+v err=%v", s, err)
+	}
+	if _, ok := mgr.sessions[1]; ok {
+		t.Fatal("stale pending-ID session should still be pruned")
+	}
+}

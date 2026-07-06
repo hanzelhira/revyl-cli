@@ -444,6 +444,10 @@ func runDeviceBatch(ctx context.Context, api batchSessionAPI, steps []batchStep,
 var deviceBatchCmd = &cobra.Command{
 	Use:   "batch",
 	Short: "Run multiple device actions in one invocation (JSON steps, compact JSONL output)",
+	// Runtime failures (step errors, ambiguous sessions) are not usage
+	// mistakes; dumping the flag reference on them wastes the tokens this
+	// command exists to save.
+	SilenceUsage: true,
 	Long: `Run a sequence of device actions in a single CLI call.
 
 Steps are JSON objects with an "action" field, provided as a JSON array or

@@ -2331,6 +2331,14 @@ func (m *DeviceSessionManager) SyncSessions(ctx context.Context) error {
 		if allBackendIDs[ls.SessionID] {
 			continue
 		}
+		// A freshly started session can have an empty SessionID when the
+		// backend's session list lagged at commit time (likelier with
+		// concurrent starts). Give it a grace period instead of pruning:
+		// the workflow-based reconcile above fills in the ID once the
+		// backend catches up.
+		if ls.SessionID == "" && ls.WorkflowRunID != "" && time.Since(ls.StartedAt) < 2*time.Minute {
+			continue
+		}
 		// Session no longer exists on backend; clean up locally.
 		if timer, ok := m.idleTimers[idx]; ok {
 			timer.Stop()

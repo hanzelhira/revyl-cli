@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -16,17 +17,40 @@ import (
 // batchSessionAPI is the subset of DeviceSessionManager needed to execute
 // batch steps. Narrowed to an interface so tests can fake the worker side.
 type batchSessionAPI interface {
-	ResolveSession(index int) (*mcppkg.DeviceSession, error)
+	ResolveSessionRef(ref string) (*mcppkg.DeviceSession, error)
 	ResolveTargetForSession(ctx context.Context, index int, target string) (*mcppkg.ResolvedTarget, error)
 	WorkerRequestForSession(ctx context.Context, index int, path string, body interface{}) ([]byte, error)
 	ScreenshotForSession(ctx context.Context, index int) ([]byte, error)
 }
 
+// batchSessionRef is a step's "s" field: a session index (JSON number) or a
+// label / "active" (JSON string). set distinguishes absent from provided.
+type batchSessionRef struct {
+	set bool
+	ref string
+}
+
+func (r *batchSessionRef) UnmarshalJSON(data []byte) error {
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		r.set = true
+		r.ref = strings.TrimSpace(asString)
+		return nil
+	}
+	var asInt int
+	if err := json.Unmarshal(data, &asInt); err == nil {
+		r.set = true
+		r.ref = strconv.Itoa(asInt)
+		return nil
+	}
+	return fmt.Errorf(`"s" must be a session index (number) or label (string)`)
+}
+
 // batchStep is one action in a batch. Pointer fields distinguish "not
 // provided" from zero values (coordinates and drag endpoints can be 0).
 type batchStep struct {
-	Action     string   `json:"action"`
-	Session    *int     `json:"s,omitempty"`
+	Action     string          `json:"action"`
+	Session    batchSessionRef `json:"s,omitempty"`
 	Target     string   `json:"target,omitempty"`
 	X          *int     `json:"x,omitempty"`
 	Y          *int     `json:"y,omitempty"`
@@ -50,6 +74,7 @@ type batchStepResult struct {
 	Index     int         `json:"i"`
 	Action    string      `json:"action"`
 	Session   int         `json:"s"`
+	Label     string      `json:"label,omitempty"`
 	OK        bool        `json:"ok"`
 	X         *int        `json:"x,omitempty"`
 	Y         *int        `json:"y,omitempty"`
@@ -191,9 +216,9 @@ func normalizeBatchKey(rawKey string) (string, error) {
 
 // executeBatchStep runs a single step against its session and returns the
 // compact result. Never panics; all failures land in result.Error.
-func executeBatchStep(ctx context.Context, api batchSessionAPI, stepIndex int, step batchStep, defaultSession int) batchStepResult {
+func executeBatchStep(ctx context.Context, api batchSessionAPI, stepIndex int, step batchStep, defaultRef string) batchStepResult {
 	action := normalizeBatchAction(step.Action)
-	result := batchStepResult{Index: stepIndex, Action: action, Session: defaultSession}
+	result := batchStepResult{Index: stepIndex, Action: action, Session: -1}
 
 	fail := func(err error) batchStepResult {
 		result.OK = false
@@ -205,15 +230,16 @@ func executeBatchStep(ctx context.Context, api batchSessionAPI, stepIndex int, s
 		return fail(err)
 	}
 
-	sessionIdx := defaultSession
-	if step.Session != nil {
-		sessionIdx = *step.Session
+	sessionRef := defaultRef
+	if step.Session.set {
+		sessionRef = step.Session.ref
 	}
-	session, err := api.ResolveSession(sessionIdx)
+	session, err := api.ResolveSessionRef(sessionRef)
 	if err != nil {
 		return fail(err)
 	}
 	result.Session = session.Index
+	result.Label = session.Label
 
 	// tap with a target goes through /tap_target (server-side ground + tap
 	// in one round trip), matching the standalone tap command.
@@ -370,13 +396,36 @@ func applyActionResult(result batchStepResult, ar ActionResult) batchStepResult 
 	return result
 }
 
+// checkBatchSessionAmbiguity refuses implicit active-session routing when
+// several sessions are live: with no -s default, every step must carry its
+// own "s". Failing upfront means no step mutates device state before the
+// mistake surfaces.
+func checkBatchSessionAmbiguity(steps []batchStep, defaultRef string, sessions []*mcppkg.DeviceSession) error {
+	if len(sessions) <= 1 || strings.TrimSpace(defaultRef) != "" {
+		return nil
+	}
+	var implicit []int
+	for i, step := range steps {
+		if !step.Session.set {
+			implicit = append(implicit, i)
+		}
+	}
+	if len(implicit) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%d sessions active (%s) and step(s) %v have no \"s\" — add \"s\": <index|label> to each step or pass -s <index|label> as the default",
+		len(sessions), sessionRoster(sessions), implicit,
+	)
+}
+
 // runDeviceBatch executes steps sequentially, streaming one compact JSON
 // line per step to w, and returns the summary.
-func runDeviceBatch(ctx context.Context, api batchSessionAPI, steps []batchStep, defaultSession int, continueOnError bool, w io.Writer) batchSummary {
+func runDeviceBatch(ctx context.Context, api batchSessionAPI, steps []batchStep, defaultRef string, continueOnError bool, w io.Writer) batchSummary {
 	summary := batchSummary{Summary: true, Total: len(steps)}
 	enc := json.NewEncoder(w)
 	for i, step := range steps {
-		result := executeBatchStep(ctx, api, i, step, defaultSession)
+		result := executeBatchStep(ctx, api, i, step, defaultRef)
 		_ = enc.Encode(result)
 		if result.OK {
 			summary.OK++
@@ -398,8 +447,10 @@ var deviceBatchCmd = &cobra.Command{
 	Long: `Run a sequence of device actions in a single CLI call.
 
 Steps are JSON objects with an "action" field, provided as a JSON array or
-JSON Lines via --steps, --file, or stdin. Each step may set "s" to target a
-specific session index, so one batch can drive multiple sessions.
+JSON Lines via --steps, --file, or stdin. Each step may set "s" to a session
+index or label, so one batch can drive multiple sessions. When more than one
+session is active, every step must address its session explicitly (per-step
+"s" or the -s default) — implicit active-session routing is refused.
 
 Supported actions: tap, double_tap, long_press, type, clear_text, swipe,
 drag, pinch, key, wait, back, home, shake, kill_app, launch, open_app,
@@ -411,7 +462,7 @@ to keep coding-agent token usage low.`,
   echo '{"action":"tap","x":200,"y":400}
 {"action":"key","key":"ENTER"}' | revyl device batch
   revyl device batch --file steps.json --continue-on-error
-  revyl device batch --steps '[{"action":"screenshot","s":0},{"action":"screenshot","s":1}]'`,
+  revyl device batch --steps '[{"action":"screenshot","s":"checkout-ios"},{"action":"screenshot","s":1}]'`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		inline, _ := cmd.Flags().GetString("steps")
 		file, _ := cmd.Flags().GetString("file")
@@ -445,10 +496,14 @@ to keep coding-agent token usage low.`,
 		if err != nil {
 			return err
 		}
-		defaultSession, _ := cmd.Flags().GetInt("s")
+		defaultRef, _ := cmd.Flags().GetString("s")
 		continueOnError, _ := cmd.Flags().GetBool("continue-on-error")
 
-		summary := runDeviceBatch(cmd.Context(), mgr, steps, defaultSession, continueOnError, cmd.OutOrStdout())
+		if err := checkBatchSessionAmbiguity(steps, defaultRef, mgr.ListSessions()); err != nil {
+			return err
+		}
+
+		summary := runDeviceBatch(cmd.Context(), mgr, steps, defaultRef, continueOnError, cmd.OutOrStdout())
 		if summary.Failed > 0 {
 			return fmt.Errorf("%d/%d steps failed", summary.Failed, summary.Total)
 		}
@@ -460,6 +515,6 @@ func init() {
 	deviceBatchCmd.Flags().String("steps", "", "Inline steps as a JSON array or JSON Lines")
 	deviceBatchCmd.Flags().String("file", "", "Read steps from a file ('-' for stdin)")
 	deviceBatchCmd.Flags().Bool("continue-on-error", false, "Continue executing remaining steps after a failure")
-	deviceBatchCmd.Flags().IntP("s", "s", -1, "Default session index for steps without an explicit \"s\" (-1 for active)")
+	deviceBatchCmd.Flags().StringP("s", "s", "", "Default session (index or label) for steps without an explicit \"s\"")
 	deviceCmd.AddCommand(deviceBatchCmd)
 }

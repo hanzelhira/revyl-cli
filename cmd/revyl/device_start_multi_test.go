@@ -47,6 +47,7 @@ func (f *fakeMultiStarter) StartSession(ctx context.Context, opts mcppkg.StartSe
 	return idx, &mcppkg.DeviceSession{
 		Index:     idx,
 		Platform:  opts.Platform,
+		Label:     opts.Label,
 		SessionID: fmt.Sprintf("sess-%d", idx),
 		ViewerURL: fmt.Sprintf("https://app.revyl.ai/sessions/sess-%d", idx),
 	}, nil
@@ -56,7 +57,7 @@ func TestRunMultiDeviceStart_ParallelAndJSON(t *testing.T) {
 	starter := &fakeMultiStarter{delay: 50 * time.Millisecond}
 	var out strings.Builder
 
-	err := runMultiDeviceStart(context.Background(), starter, []string{"ios", "android"}, 2, mcppkg.StartSessionOptions{}, true, &out)
+	err := runMultiDeviceStart(context.Background(), starter, []string{"ios", "android"}, 2, nil, mcppkg.StartSessionOptions{}, true, &out)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestRunMultiDeviceStart_PartialFailure(t *testing.T) {
 	starter := &fakeMultiStarter{failFor: map[string]error{"android": fmt.Errorf("no capacity")}}
 	var out strings.Builder
 
-	err := runMultiDeviceStart(context.Background(), starter, []string{"ios", "android"}, 1, mcppkg.StartSessionOptions{}, true, &out)
+	err := runMultiDeviceStart(context.Background(), starter, []string{"ios", "android"}, 1, nil, mcppkg.StartSessionOptions{}, true, &out)
 	if err == nil || !strings.Contains(err.Error(), "1/2 sessions failed") {
 		t.Fatalf("expected partial failure error, got %v", err)
 	}
@@ -110,5 +111,72 @@ func TestRunMultiDeviceStart_PartialFailure(t *testing.T) {
 	}
 	if !iosOK || !androidErr {
 		t.Errorf("unexpected results: %+v", results)
+	}
+}
+
+func TestRunMultiDeviceStart_LabelsAssignedInOrder(t *testing.T) {
+	starter := &fakeMultiStarter{}
+	var out strings.Builder
+
+	labels := []string{"ios-a", "ios-b", "droid-a", "droid-b"}
+	err := runMultiDeviceStart(context.Background(), starter, []string{"ios", "android"}, 2, labels, mcppkg.StartSessionOptions{}, true, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var results []multiStartResult
+	if err := json.Unmarshal([]byte(out.String()), &results); err != nil {
+		t.Fatalf("output not a JSON array: %v", err)
+	}
+	got := map[string]string{}
+	for _, r := range results {
+		got[r.Label] = r.Platform
+	}
+	if got["ios-a"] != "ios" || got["ios-b"] != "ios" || got["droid-a"] != "android" || got["droid-b"] != "android" {
+		t.Errorf("labels not assigned in spec order: %+v", results)
+	}
+}
+
+func TestParseDeviceStartLabels(t *testing.T) {
+	existing := []*mcppkg.DeviceSession{{Index: 0, Platform: "ios", Label: "taken"}}
+
+	cases := []struct {
+		name    string
+		flag    string
+		total   int
+		wantErr string
+		want    []string
+	}{
+		{"empty means none", "", 3, "", nil},
+		{"single ok", "checkout", 1, "", []string{"checkout"}},
+		{"multi ok with spaces", "a-1, b-2", 2, "", []string{"a-1", "b-2"}},
+		{"count mismatch", "only-one", 2, "1 label(s) but 2 session(s)", nil},
+		{"numeric rejected", "42", 1, "must not be a number", nil},
+		{"reserved rejected", "active", 1, "reserved", nil},
+		{"bad charset", "has space", 1, "may only contain", nil},
+		{"duplicate in list", "same,SAME", 2, "duplicate label", nil},
+		{"collides with existing", "Taken", 1, "already used by session 0", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseDeviceStartLabels(tc.flag, tc.total, existing)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }

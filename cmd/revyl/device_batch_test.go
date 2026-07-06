@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -30,8 +31,22 @@ type fakeBatchCall struct {
 	Body    interface{}
 }
 
-func (f *fakeBatchAPI) ResolveSession(index int) (*mcppkg.DeviceSession, error) {
-	if index == -1 {
+func (f *fakeBatchAPI) ResolveSessionRef(ref string) (*mcppkg.DeviceSession, error) {
+	ref = strings.TrimSpace(ref)
+	index := f.active
+	if ref != "" && !strings.EqualFold(ref, "active") {
+		if n, err := strconv.Atoi(ref); err == nil {
+			index = n
+		} else {
+			for _, s := range f.sessions {
+				if strings.EqualFold(s.Label, ref) {
+					return s, nil
+				}
+			}
+			return nil, fmt.Errorf("no session labeled %q", ref)
+		}
+	}
+	if index < 0 {
 		index = f.active
 	}
 	s, ok := f.sessions[index]
@@ -71,13 +86,17 @@ func newFakeBatchAPI() *fakeBatchAPI {
 	return &fakeBatchAPI{
 		sessions: map[int]*mcppkg.DeviceSession{
 			0: {Index: 0, SessionID: "sess-0", Platform: "ios"},
-			1: {Index: 1, SessionID: "sess-1", Platform: "android"},
+			1: {Index: 1, SessionID: "sess-1", Platform: "android", Label: "droid"},
 		},
 		active:     0,
 		responses:  map[string][]byte{},
 		failPaths:  map[string]error{},
 		screenshot: []byte("png-bytes"),
 	}
+}
+
+func stepRef(ref string) batchSessionRef {
+	return batchSessionRef{set: true, ref: ref}
 }
 
 func decodeBatchLines(t *testing.T, out string) ([]batchStepResult, batchSummary) {
@@ -125,6 +144,26 @@ func TestParseBatchSteps_ArrayAndJSONL(t *testing.T) {
 	}
 	if _, err := parseBatchSteps([]byte(`{"action":"tap" BROKEN`)); err == nil {
 		t.Error("expected error for malformed line")
+	}
+}
+
+func TestParseBatchSteps_SessionRefFormats(t *testing.T) {
+	steps, err := parseBatchSteps([]byte(`[{"action":"back","s":1},{"action":"back","s":"droid"},{"action":"back"}]`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !steps[0].Session.set || steps[0].Session.ref != "1" {
+		t.Errorf(`numeric "s" not parsed: %+v`, steps[0].Session)
+	}
+	if !steps[1].Session.set || steps[1].Session.ref != "droid" {
+		t.Errorf(`string "s" not parsed: %+v`, steps[1].Session)
+	}
+	if steps[2].Session.set {
+		t.Errorf(`absent "s" should not be set: %+v`, steps[2].Session)
+	}
+
+	if _, err := parseBatchSteps([]byte(`[{"action":"back","s":true}]`)); err == nil {
+		t.Error(`expected error for boolean "s"`)
 	}
 }
 
@@ -181,7 +220,7 @@ func TestRunDeviceBatch_HappyPath(t *testing.T) {
 	}
 
 	var out strings.Builder
-	summary := runDeviceBatch(context.Background(), api, steps, -1, false, &out)
+	summary := runDeviceBatch(context.Background(), api, steps, "", false, &out)
 
 	if summary.Failed != 0 || summary.OK != 4 || summary.Total != 4 {
 		t.Fatalf("unexpected summary: %+v", summary)
@@ -228,7 +267,7 @@ func TestRunDeviceBatch_StopsOnFirstFailure(t *testing.T) {
 		{Action: "home"},
 	}
 	var out strings.Builder
-	summary := runDeviceBatch(context.Background(), api, steps, -1, false, &out)
+	summary := runDeviceBatch(context.Background(), api, steps, "", false, &out)
 
 	if summary.OK != 1 || summary.Failed != 1 || summary.Skipped != 1 {
 		t.Fatalf("unexpected summary: %+v", summary)
@@ -251,7 +290,7 @@ func TestRunDeviceBatch_ContinueOnError(t *testing.T) {
 		{Action: "home"},
 	}
 	var out strings.Builder
-	summary := runDeviceBatch(context.Background(), api, steps, -1, true, &out)
+	summary := runDeviceBatch(context.Background(), api, steps, "", true, &out)
 
 	if summary.OK != 1 || summary.Failed != 1 || summary.Skipped != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
@@ -260,23 +299,39 @@ func TestRunDeviceBatch_ContinueOnError(t *testing.T) {
 
 func TestRunDeviceBatch_PerStepSessionOverride(t *testing.T) {
 	api := newFakeBatchAPI()
-	s1 := 1
 	steps := []batchStep{
 		{Action: "back"},
-		{Action: "back", Session: &s1},
+		{Action: "back", Session: stepRef("1")},
+		{Action: "back", Session: stepRef("droid")},
 	}
 	var out strings.Builder
-	runDeviceBatch(context.Background(), api, steps, -1, false, &out)
+	runDeviceBatch(context.Background(), api, steps, "", false, &out)
 
 	results, summary := decodeBatchLines(t, out.String())
 	if summary.Failed != 0 {
 		t.Fatalf("unexpected failures: %+v", summary)
 	}
-	if results[0].Session != 0 || results[1].Session != 1 {
+	if results[0].Session != 0 || results[1].Session != 1 || results[2].Session != 1 {
 		t.Errorf("session routing wrong: %+v", results)
 	}
-	if api.calls[0].Session != 0 || api.calls[1].Session != 1 {
+	if results[2].Label != "droid" {
+		t.Errorf("expected label echoed on result, got %+v", results[2])
+	}
+	if api.calls[0].Session != 0 || api.calls[1].Session != 1 || api.calls[2].Session != 1 {
 		t.Errorf("worker calls hit wrong sessions: %+v", api.calls)
+	}
+}
+
+func TestRunDeviceBatch_DefaultRefLabel(t *testing.T) {
+	api := newFakeBatchAPI()
+	steps := []batchStep{{Action: "back"}}
+	var out strings.Builder
+	summary := runDeviceBatch(context.Background(), api, steps, "droid", false, &out)
+	if summary.Failed != 0 {
+		t.Fatalf("unexpected failures: %+v", summary)
+	}
+	if api.calls[0].Session != 1 {
+		t.Errorf("default label ref not applied: %+v", api.calls)
 	}
 }
 
@@ -286,7 +341,7 @@ func TestRunDeviceBatch_WorkerReportsFailure(t *testing.T) {
 
 	steps := []batchStep{{Action: "tap", Target: "Ghost Button"}}
 	var out strings.Builder
-	summary := runDeviceBatch(context.Background(), api, steps, -1, false, &out)
+	summary := runDeviceBatch(context.Background(), api, steps, "", false, &out)
 
 	if summary.Failed != 1 {
 		t.Fatalf("expected failure, got %+v", summary)
@@ -299,12 +354,18 @@ func TestRunDeviceBatch_WorkerReportsFailure(t *testing.T) {
 
 func TestRunDeviceBatch_UnknownSession(t *testing.T) {
 	api := newFakeBatchAPI()
-	s9 := 9
-	steps := []batchStep{{Action: "back", Session: &s9}}
+	steps := []batchStep{{Action: "back", Session: stepRef("9")}}
 	var out strings.Builder
-	summary := runDeviceBatch(context.Background(), api, steps, -1, false, &out)
+	summary := runDeviceBatch(context.Background(), api, steps, "", false, &out)
 	if summary.Failed != 1 {
 		t.Fatalf("expected failure for unknown session, got %+v", summary)
+	}
+
+	steps = []batchStep{{Action: "back", Session: stepRef("no-such-label")}}
+	out.Reset()
+	summary = runDeviceBatch(context.Background(), api, steps, "", false, &out)
+	if summary.Failed != 1 {
+		t.Fatalf("expected failure for unknown label, got %+v", summary)
 	}
 }
 
@@ -312,7 +373,7 @@ func batchIntPtr(v int) *int { return &v }
 
 func TestExecuteBatchStep_OpenAppResolvesSystemBundle(t *testing.T) {
 	api := newFakeBatchAPI()
-	result := executeBatchStep(context.Background(), api, 0, batchStep{Action: "open_app", App: "settings"}, -1)
+	result := executeBatchStep(context.Background(), api, 0, batchStep{Action: "open_app", App: "settings"}, "")
 	if !result.OK {
 		t.Fatalf("open_app failed: %s", result.Error)
 	}
@@ -325,3 +386,36 @@ func TestExecuteBatchStep_OpenAppResolvesSystemBundle(t *testing.T) {
 	}
 }
 
+func TestCheckBatchSessionAmbiguity(t *testing.T) {
+	two := []*mcppkg.DeviceSession{
+		{Index: 0, Platform: "ios", Label: "checkout"},
+		{Index: 1, Platform: "android"},
+	}
+	one := two[:1]
+
+	// Single session: implicit routing is unambiguous.
+	if err := checkBatchSessionAmbiguity([]batchStep{{Action: "back"}}, "", one); err != nil {
+		t.Errorf("single session should pass: %v", err)
+	}
+	// Multiple sessions + explicit default: fine.
+	if err := checkBatchSessionAmbiguity([]batchStep{{Action: "back"}}, "checkout", two); err != nil {
+		t.Errorf("explicit default should pass: %v", err)
+	}
+	// Multiple sessions + every step explicit: fine.
+	steps := []batchStep{{Action: "back", Session: stepRef("0")}, {Action: "back", Session: stepRef("1")}}
+	if err := checkBatchSessionAmbiguity(steps, "", two); err != nil {
+		t.Errorf("all-explicit steps should pass: %v", err)
+	}
+	// Multiple sessions + an implicit step: refused, naming the roster and
+	// the offending step indices.
+	steps = []batchStep{{Action: "back", Session: stepRef("0")}, {Action: "back"}}
+	err := checkBatchSessionAmbiguity(steps, "", two)
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	for _, want := range []string{"2 sessions active", `0=ios "checkout"`, "1=android", "[1]"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+}

@@ -369,8 +369,8 @@ func init() {
 	// Persistent flags shared by every `state` subcommand.
 	deviceStateCmd.PersistentFlags().Bool("json", false,
 		"Emit raw JSON instead of pretty-printed output")
-	deviceStateCmd.PersistentFlags().IntP("s", "s", -1,
-		"Session index to target (-1 for active)")
+	deviceStateCmd.PersistentFlags().StringP("s", "s", "",
+		"Session to target: index or label (default: active session)")
 
 	deviceStateDiffCmd.Flags().String("since", "",
 		"Snapshot id returned by a prior `device state snapshot` (required)")

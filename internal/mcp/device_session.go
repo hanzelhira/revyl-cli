@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +82,11 @@ type DeviceSession struct {
 
 	// Platform is "ios" or "android".
 	Platform string `json:"platform"`
+
+	// Label is an optional user-assigned name for this session (local-only;
+	// the backend never sees it). Resolvable anywhere a session index is
+	// accepted. Empty when unset.
+	Label string `json:"label,omitempty"`
 
 	// ScreenWidth is the device screen width in pixels (0 when unknown).
 	ScreenWidth int `json:"screen_width,omitempty"`
@@ -313,6 +319,11 @@ type StartSessionOptions struct {
 	OsVersion string
 	// DeviceRunnerID pins the session to a specific worker DEVICE_ID label.
 	DeviceRunnerID string
+
+	// Label optionally names the new session (see ValidateSessionLabel).
+	// A label that turns out invalid or already taken at commit time is
+	// dropped with a warning rather than failing the provisioned session.
+	Label string
 }
 
 // StartSession provisions a new cloud device and adds it to the session map.
@@ -504,6 +515,25 @@ func (m *DeviceSessionManager) StartSession(
 		session.ScreenHeight = lastHealth.ScreenHeight
 	}
 
+	// The device is already provisioned by now, so a bad label degrades to a
+	// warning instead of failing the session.
+	if label := strings.TrimSpace(opts.Label); label != "" {
+		labelErr := ValidateSessionLabel(label)
+		if labelErr == nil {
+			for _, s := range m.sessions {
+				if strings.EqualFold(s.Label, label) {
+					labelErr = fmt.Errorf("label %q already used by session %d", label, s.Index)
+					break
+				}
+			}
+		}
+		if labelErr != nil {
+			ui.PrintWarning("Session started without label: %v", labelErr)
+		} else {
+			session.Label = label
+		}
+	}
+
 	m.sessions[idx] = session
 
 	// Auto-set as active if this is the first session
@@ -689,6 +719,101 @@ func (m *DeviceSessionManager) ResolveSession(index int) (*DeviceSession, error)
 	}
 
 	return nil, fmt.Errorf("multiple sessions active. Specify session_index or call list_device_sessions() to see them")
+}
+
+// labelCharset restricts labels to token-safe characters so they can appear
+// unquoted in CLI args and JSON step refs.
+func labelCharsetOK(label string) bool {
+	for _, r := range label {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateSessionLabel checks that a label is usable as a session reference.
+// Labels share a namespace with numeric indices and the "active" keyword, so
+// anything that parses as an integer or collides with "active" is rejected.
+func ValidateSessionLabel(label string) error {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return fmt.Errorf("label must not be empty")
+	}
+	if !labelCharsetOK(label) {
+		return fmt.Errorf("label %q may only contain letters, digits, '.', '_' and '-'", label)
+	}
+	if _, err := strconv.Atoi(label); err == nil {
+		return fmt.Errorf("label %q must not be a number (numbers are session indices)", label)
+	}
+	if strings.EqualFold(label, "active") {
+		return fmt.Errorf("label %q is reserved", label)
+	}
+	return nil
+}
+
+// ResolveSessionRef resolves a session by flexible reference:
+// empty / "active" / "-1" -> active session, digits -> index, otherwise ->
+// case-insensitive label match.
+func (m *DeviceSessionManager) ResolveSessionRef(ref string) (*DeviceSession, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.EqualFold(ref, "active") {
+		return m.ResolveSession(-1)
+	}
+	if idx, err := strconv.Atoi(ref); err == nil {
+		return m.ResolveSession(idx)
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		if strings.EqualFold(s.Label, ref) {
+			return s, nil
+		}
+	}
+	labels := make([]string, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		if s.Label != "" {
+			labels = append(labels, s.Label)
+		}
+	}
+	sort.Strings(labels)
+	if len(labels) > 0 {
+		return nil, fmt.Errorf("no session labeled %q (labels: %s). Call list_device_sessions() to see active sessions", ref, strings.Join(labels, ", "))
+	}
+	return nil, fmt.Errorf("no session labeled %q. Call list_device_sessions() to see active sessions", ref)
+}
+
+// SetSessionLabel assigns (or clears, with an empty label) the label of the
+// session at the given index. Labels are unique case-insensitively.
+func (m *DeviceSessionManager) SetSessionLabel(index int, label string) error {
+	label = strings.TrimSpace(label)
+	if label != "" {
+		if err := ValidateSessionLabel(label); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[index]
+	if !ok {
+		return fmt.Errorf("no session at index %d. Call list_device_sessions() to see active sessions", index)
+	}
+	if label != "" {
+		for idx, s := range m.sessions {
+			if idx != index && strings.EqualFold(s.Label, label) {
+				return fmt.Errorf("label %q already used by session %d", label, idx)
+			}
+		}
+	}
+	session.Label = label
+	m.persistSessions()
+	return nil
 }
 
 // ResetIdleTimer resets the idle timeout for a specific session.

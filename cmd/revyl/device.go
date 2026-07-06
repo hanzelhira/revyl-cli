@@ -64,12 +64,42 @@ func getDeviceSessionMgr(cmd *cobra.Command) (*mcppkg.DeviceSessionManager, erro
 // resolveSessionFlag reads the -s flag and resolves a session.
 // Returns the resolved session. Pass -1 (flag default) for auto-resolution.
 func resolveSessionFlag(cmd *cobra.Command, mgr *mcppkg.DeviceSessionManager) (*mcppkg.DeviceSession, error) {
-	sidx, _ := cmd.Flags().GetInt("s")
-	session, err := mgr.ResolveSession(sidx)
+	ref, _ := cmd.Flags().GetString("s")
+	session, err := mgr.ResolveSessionRef(ref)
 	if err != nil {
 		return nil, humanizeDeviceSessionResolveError(cmd, err)
 	}
+	// Implicit routing with several sessions live is the classic
+	// wrong-device mistake; surface which session was picked.
+	if strings.TrimSpace(ref) == "" && mgr.SessionCount() > 1 {
+		ui.PrintWarning(
+			"Targeting session %s; %d sessions active — pass -s <index|label> to be explicit",
+			sessionDisplayName(session), mgr.SessionCount(),
+		)
+	}
 	return session, nil
+}
+
+// sessionDisplayName renders a session as `0 (ios "checkout")` for messages.
+func sessionDisplayName(s *mcppkg.DeviceSession) string {
+	if s.Label != "" {
+		return fmt.Sprintf("%d (%s %q)", s.Index, s.Platform, s.Label)
+	}
+	return fmt.Sprintf("%d (%s)", s.Index, s.Platform)
+}
+
+// sessionRoster renders all sessions as `0=ios "checkout", 1=android` for
+// error messages.
+func sessionRoster(sessions []*mcppkg.DeviceSession) string {
+	parts := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		if s.Label != "" {
+			parts = append(parts, fmt.Sprintf("%d=%s %q", s.Index, s.Platform, s.Label))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d=%s", s.Index, s.Platform))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // resolveTargetOrCoords checks whether --target was provided or --x/--y were
@@ -312,6 +342,9 @@ func formatDeviceInfoFallback(session *mcppkg.DeviceSession) string {
 		fmt.Sprintf("Platform: %s", session.Platform),
 		fmt.Sprintf("Viewer: %s", session.ViewerURL),
 	}
+	if session.Label != "" {
+		lines = append(lines, fmt.Sprintf("Label: %s", session.Label))
+	}
 	if session.ScreenWidth > 0 && session.ScreenHeight > 0 {
 		lines = append(lines, fmt.Sprintf("Screen: %dx%d", session.ScreenWidth, session.ScreenHeight))
 	}
@@ -463,7 +496,7 @@ func humanizeDeviceSessionResolveError(cmd *cobra.Command, err error) error {
 	cmdPrefix := deviceCommandPrefix(cmd)
 
 	if strings.Contains(msg, "multiple sessions active") {
-		return fmt.Errorf("multiple sessions active. Specify -s <index> or run '%s device list' to see active sessions", cmdPrefix)
+		return fmt.Errorf("multiple sessions active. Specify -s <index|label> or run '%s device list' to see active sessions", cmdPrefix)
 	}
 
 	msg = strings.ReplaceAll(msg,
@@ -502,8 +535,9 @@ var deviceStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start a device session",
 	Example: `  revyl device start --platform ios
-  revyl device start --platform ios,android --json    # two sessions in parallel
-  revyl device start --platform ios --count 2 --json  # two iOS sessions
+  revyl device start --platform ios --label checkout-ios
+  revyl device start --platform ios,android --label checkout-ios,checkout-droid --json
+  revyl device start --platform ios --count 2 --json  # two iOS sessions in parallel
   revyl device start --platform android --timeout 600
   revyl device start --platform ios --launch-var API_URL --launch-var DEBUG
   revyl device start --platform ios --json`,
@@ -571,6 +605,12 @@ var deviceStartCmd = &cobra.Command{
 		}
 		platform = platforms[0]
 		multiStart := len(platforms)*count > 1
+
+		labelFlag, _ := cmd.Flags().GetString("label")
+		labels, err := parseDeviceStartLabels(labelFlag, len(platforms)*count, mgr.ListSessions())
+		if err != nil {
+			return err
+		}
 		if !cmd.Flags().Changed("timeout") {
 			cwd, cwdErr := os.Getwd()
 			if cwdErr == nil {
@@ -685,9 +725,12 @@ var deviceStartCmd = &cobra.Command{
 			DeviceModel:        selectedDeviceModel,
 			OsVersion:          selectedOsVersion,
 		}
+		if len(labels) == 1 && !multiStart {
+			startOpts.Label = labels[0]
+		}
 
 		if multiStart {
-			return runMultiDeviceStart(ctx, mgr, platforms, count, startOpts, jsonOutput, cmd.OutOrStdout())
+			return runMultiDeviceStart(ctx, mgr, platforms, count, labels, startOpts, jsonOutput, cmd.OutOrStdout())
 		}
 
 		var session *mcppkg.DeviceSession
@@ -2226,23 +2269,27 @@ var deviceListCmd = &cobra.Command{
 		}
 
 		activeIdx := mgr.ActiveIndex()
-		fmt.Printf("  %-3s %-10s %-10s %-12s %s\n", "#", "PLATFORM", "STATUS", "SESSION ID", "UPTIME")
+		fmt.Printf("  %-3s %-16s %-10s %-10s %-12s %s\n", "#", "LABEL", "PLATFORM", "STATUS", "SESSION ID", "UPTIME")
 		for _, s := range sessions {
 			marker := " "
 			if s.Index == activeIdx {
 				marker = "*"
 			}
+			label := s.Label
+			if label == "" {
+				label = "-"
+			}
 			idShort := truncatePrefix(s.SessionID, 8)
 			uptime := time.Since(s.StartedAt).Round(time.Second)
-			fmt.Printf("%s %-3d %-10s %-10s %-12s %s\n", marker, s.Index, s.Platform, "running", idShort, uptime)
+			fmt.Printf("%s %-3d %-16s %-10s %-10s %-12s %s\n", marker, s.Index, truncatePrefix(label, 16), s.Platform, "running", idShort, uptime)
 		}
 		return nil
 	},
 }
 
 var deviceUseCmd = &cobra.Command{
-	Use:   "use <index>",
-	Short: "Switch active session to the given index",
+	Use:   "use <index|label>",
+	Short: "Switch active session to the given index or label",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mgr, err := getDeviceSessionMgr(cmd)
@@ -2250,20 +2297,55 @@ var deviceUseCmd = &cobra.Command{
 			return err
 		}
 
-		var idx int
-		if _, parseErr := fmt.Sscanf(args[0], "%d", &idx); parseErr != nil {
-			return fmt.Errorf("invalid session index: %s (must be an integer)", args[0])
+		session, err := mgr.ResolveSessionRef(args[0])
+		if err != nil {
+			return humanizeDeviceSessionResolveError(cmd, err)
 		}
-
-		if err := mgr.SetActive(idx); err != nil {
+		if err := mgr.SetActive(session.Index); err != nil {
 			return err
 		}
+		ui.PrintSuccess("Switched to session %s", sessionDisplayName(session))
+		return nil
+	},
+}
 
-		session := mgr.GetSession(idx)
-		if session != nil {
-			ui.PrintSuccess("Switched to session %d (%s)", idx, session.Platform)
+var deviceLabelCmd = &cobra.Command{
+	Use:   "label <session> [name]",
+	Short: "Set or clear a session's label (use it anywhere -s takes an index)",
+	Example: `  revyl device label 0 checkout-ios
+  revyl device label active logged-in
+  revyl device label checkout-ios renamed-label
+  revyl device label 0 --clear`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		mgr, err := getDeviceSessionMgr(cmd)
+		if err != nil {
+			return err
+		}
+		session, err := mgr.ResolveSessionRef(args[0])
+		if err != nil {
+			return humanizeDeviceSessionResolveError(cmd, err)
+		}
+
+		clear, _ := cmd.Flags().GetBool("clear")
+		label := ""
+		if len(args) == 2 {
+			label = strings.TrimSpace(args[1])
+		}
+		if clear && label != "" {
+			return fmt.Errorf("provide a label or --clear, not both")
+		}
+		if !clear && label == "" {
+			return fmt.Errorf("label name is required: revyl device label <session> <name> (or --clear)")
+		}
+
+		if err := mgr.SetSessionLabel(session.Index, label); err != nil {
+			return err
+		}
+		if label == "" {
+			jsonOrPrint(cmd, map[string]interface{}{"index": session.Index, "label": ""}, fmt.Sprintf("Cleared label on session %d", session.Index))
 		} else {
-			ui.PrintSuccess("Switched to session %d", idx)
+			jsonOrPrint(cmd, map[string]interface{}{"index": session.Index, "label": label}, fmt.Sprintf("Session %d labeled %q", session.Index, label))
 		}
 		return nil
 	},
@@ -2855,12 +2937,13 @@ func truncateLiveRequestURL(s string, max int) string {
 func init() {
 	// Global -s flag for session selection (added to all action commands)
 	sessionFlag := func(cmd *cobra.Command) {
-		cmd.Flags().IntP("s", "s", -1, "Session index to target (-1 for active)")
+		cmd.Flags().StringP("s", "s", "", "Session to target: index or label (default: active session)")
 	}
 
 	// Start
 	deviceStartCmd.Flags().String("platform", "", "Platform: ios or android, or a comma-separated list to start multiple sessions (inferred from --app-id/--build-version-id when omitted, defaults to ios)")
 	deviceStartCmd.Flags().Int("count", 1, "Number of sessions to start per platform (started in parallel)")
+	deviceStartCmd.Flags().String("label", "", "Label for the new session (comma-separated list matching session order for multi-start)")
 	deviceStartCmd.Flags().Int("timeout", 300, "Idle timeout in seconds")
 	deviceStartCmd.Flags().Bool("open", true, "Open viewer in browser after device is ready")
 	deviceStartCmd.Flags().String("app-id", "", "App ID to resolve latest build from")
@@ -3115,6 +3198,9 @@ func init() {
 	deviceCmd.AddCommand(deviceDoctorCmd)
 	deviceCmd.AddCommand(deviceListCmd)
 	deviceCmd.AddCommand(deviceUseCmd)
+	deviceLabelCmd.Flags().Bool("clear", false, "Remove the session's label")
+	deviceLabelCmd.Flags().Bool("json", false, "Output as JSON")
+	deviceCmd.AddCommand(deviceLabelCmd)
 	deviceCmd.AddCommand(deviceAttachCmd)
 	deviceCmd.AddCommand(deviceReportCmd)
 	sessionFlag(deviceReportCmd)

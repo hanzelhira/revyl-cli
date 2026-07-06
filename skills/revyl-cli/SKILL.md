@@ -48,18 +48,34 @@ revyl device batch --steps '[
 
 Supported actions: tap, double_tap, long_press, type, clear_text, swipe,
 drag, pinch, key, wait, back, home, shake, kill_app, launch, open_app,
-screenshot, hierarchy. Each step accepts `"s": <index>` to target a specific
-session, so one batch can drive several devices. Add `--continue-on-error`
-to run all steps regardless of failures.
+screenshot, hierarchy. Each step accepts `"s": <index or label>` to target a
+specific session, so one batch can drive several devices. Add
+`--continue-on-error` to run all steps regardless of failures.
 
-Start multiple device sessions in one parallel call, then address them with
-`-s <index>` (or per-step `"s"` in a batch):
+## Multiple Sessions: Label Everything
+
+Start multiple sessions in one parallel call and give each a label naming its
+purpose. Use labels (not indices) everywhere a session is addressed — `-s`,
+per-step `"s"`, `device use` — so scripts stay readable and cannot silently
+hit the wrong device:
 
 ```bash
-revyl device start --platform ios,android --json   # one session per platform
-revyl device start --platform ios --count 2 --json # two iOS sessions
-revyl device list --json                           # session indices and state
+revyl device start --platform ios,android --label checkout-ios,checkout-droid --json
+revyl device label 0 logged-in        # label a session after the fact
+revyl device list --json              # indices, labels, and state
+
+revyl device batch --steps '[
+  {"action":"tap","s":"checkout-ios","target":"Sign In"},
+  {"action":"tap","s":"checkout-droid","target":"Sign In"},
+  {"action":"screenshot","s":"checkout-droid","out":"droid.png"}
+]'
 ```
+
+When more than one session is active, `device batch` refuses steps without an
+explicit `"s"` (or a `-s` default) instead of guessing, and bare device
+commands print a warning naming the session they targeted. Every batch result
+line echoes the resolved session index and label, so the transcript
+self-documents which device each action hit.
 
 ## Baseline Checks
 

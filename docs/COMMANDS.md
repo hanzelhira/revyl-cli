@@ -220,21 +220,26 @@ Multiple sessions and batched actions (recommended for coding agents -- one
 invocation instead of many, compact JSON output):
 
 ```bash
-revyl device start --platform ios,android --json   # start both in parallel
-revyl device start --platform ios --count 2 --json # two iOS sessions
-revyl device list --json                           # indices for -s targeting
+revyl device start --platform ios,android --label checkout-ios,checkout-droid --json
+revyl device start --platform ios --count 2 --json # two iOS sessions in parallel
+revyl device label 0 logged-in                     # label a running session
+revyl device list --json                           # indices, labels, state
 
 revyl device batch --steps '[
-  {"action":"tap","target":"Sign In"},
-  {"action":"type","target":"email field","text":"user@example.com"},
-  {"action":"screenshot","s":1,"out":"android.png"}
+  {"action":"tap","s":"checkout-ios","target":"Sign In"},
+  {"action":"type","s":"checkout-ios","target":"email field","text":"user@example.com"},
+  {"action":"screenshot","s":"checkout-droid","out":"android.png"}
 ]'
 ```
 
 Each batch step is one action (`tap`, `type`, `swipe`, `key`, `wait`,
-`screenshot`, `hierarchy`, ...) and may set `"s"` to route to a specific
-session index. Output is one compact JSON line per step plus a summary. See
-`revyl device batch --help` for the full action list.
+`screenshot`, `hierarchy`, ...) and may set `"s"` to route to a session by
+index or label. Labels work anywhere `-s` takes an index (`-s checkout-ios`,
+`device use checkout-ios`). When more than one session is active, batch steps
+must address their session explicitly — implicit active-session routing is
+refused — and bare device commands warn which session they targeted. Output
+is one compact JSON line per step (echoing the resolved session) plus a
+summary. See `revyl device batch --help` for the full action list.
 
 ### Builds and Dev Mode
 

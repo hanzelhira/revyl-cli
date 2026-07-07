@@ -695,7 +695,9 @@ func (m *DeviceSessionManager) ResolveSession(index int) (*DeviceSession, error)
 	if index >= 0 {
 		s, ok := m.sessions[index]
 		if !ok {
-			return nil, fmt.Errorf("no session at index %d. Call list_device_sessions() to see active sessions", index)
+			// Inline the roster so the caller (usually an agent) can
+			// self-correct without a separate list round trip.
+			return nil, fmt.Errorf("no session at index %d. Active: %s", index, m.rosterLocked())
 		}
 		return s, nil
 	}
@@ -718,7 +720,30 @@ func (m *DeviceSessionManager) ResolveSession(index int) (*DeviceSession, error)
 		return nil, fmt.Errorf("no active device sessions. Start one with start_device_session(platform='ios') or start_device_session(platform='android')")
 	}
 
-	return nil, fmt.Errorf("multiple sessions active. Specify session_index or call list_device_sessions() to see them")
+	return nil, fmt.Errorf("multiple sessions active (%s). Specify session_index", m.rosterLocked())
+}
+
+// rosterLocked renders live sessions as `0=ios "checkout", 1=android` for
+// error messages. Caller must hold at least a read lock.
+func (m *DeviceSessionManager) rosterLocked() string {
+	if len(m.sessions) == 0 {
+		return "none"
+	}
+	indices := make([]int, 0, len(m.sessions))
+	for idx := range m.sessions {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+	parts := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		s := m.sessions[idx]
+		if s.Label != "" {
+			parts = append(parts, fmt.Sprintf("%d=%s %q", idx, s.Platform, s.Label))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d=%s", idx, s.Platform))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // labelCharset restricts labels to token-safe characters so they can appear
@@ -774,17 +799,7 @@ func (m *DeviceSessionManager) ResolveSessionRef(ref string) (*DeviceSession, er
 			return s, nil
 		}
 	}
-	labels := make([]string, 0, len(m.sessions))
-	for _, s := range m.sessions {
-		if s.Label != "" {
-			labels = append(labels, s.Label)
-		}
-	}
-	sort.Strings(labels)
-	if len(labels) > 0 {
-		return nil, fmt.Errorf("no session labeled %q (labels: %s). Call list_device_sessions() to see active sessions", ref, strings.Join(labels, ", "))
-	}
-	return nil, fmt.Errorf("no session labeled %q. Call list_device_sessions() to see active sessions", ref)
+	return nil, fmt.Errorf("no session labeled %q. Active: %s", ref, m.rosterLocked())
 }
 
 // SetSessionLabel assigns (or clears, with an empty label) the label of the
@@ -2337,6 +2352,13 @@ func (m *DeviceSessionManager) SyncSessions(ctx context.Context) error {
 		// the workflow-based reconcile above fills in the ID once the
 		// backend catches up.
 		if ls.SessionID == "" && ls.WorkflowRunID != "" && time.Since(ls.StartedAt) < 2*time.Minute {
+			continue
+		}
+		// A session that succeeded a worker call moments ago is alive no
+		// matter what the backend list says — a transient partial/empty
+		// response must not nuke live local state. If it is truly gone, a
+		// later sync prunes it once the activity grace lapses.
+		if time.Since(ls.LastActivity) < 90*time.Second {
 			continue
 		}
 		// Session no longer exists on backend; clean up locally.

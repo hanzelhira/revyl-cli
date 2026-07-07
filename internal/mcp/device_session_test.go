@@ -2214,3 +2214,57 @@ func TestDeviceSessionManager_SyncSessions_GracePeriodForPendingSessionID(t *tes
 		t.Fatal("stale pending-ID session should still be pruned")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestDeviceSessionManager_SyncSessions_RecentActivitySurvivesEmptyBackend:
+// A transient empty/partial backend list must not prune a session that
+// completed a worker call moments ago; stale sessions are still pruned.
+// ---------------------------------------------------------------------------
+
+func TestDeviceSessionManager_SyncSessions_RecentActivitySurvivesEmptyBackend(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/entity/users/get_user_uuid":
+			_, _ = w.Write([]byte(`{"user_id":"u1","org_id":"org-1","email":"me@example.com","concurrency_limit":10}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/execution/device-sessions/active"):
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   2,
+	}
+	// Active seconds ago: survives the flaky backend response.
+	mgr.sessions[0] = &DeviceSession{
+		Index: 0, SessionID: "live-1", WorkflowRunID: "wf-1", Platform: "ios",
+		WorkerBaseURL: "http://localhost:1",
+		StartedAt:     now.Add(-10 * time.Minute), LastActivity: now.Add(-5 * time.Second),
+	}
+	// Idle for 10 minutes and not on the backend: pruned.
+	mgr.sessions[1] = &DeviceSession{
+		Index: 1, SessionID: "stale-1", WorkflowRunID: "wf-2", Platform: "ios",
+		WorkerBaseURL: "http://localhost:1",
+		StartedAt:     now.Add(-30 * time.Minute), LastActivity: now.Add(-10 * time.Minute),
+	}
+
+	if err := mgr.SyncSessions(context.Background()); err != nil {
+		t.Fatalf("SyncSessions: %v", err)
+	}
+	if _, ok := mgr.sessions[0]; !ok {
+		t.Fatal("recently active session was pruned by empty backend response")
+	}
+	if _, ok := mgr.sessions[1]; ok {
+		t.Fatal("stale session should have been pruned")
+	}
+}

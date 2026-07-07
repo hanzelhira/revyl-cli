@@ -77,6 +77,22 @@ commands print a warning naming the session they targeted. Every batch result
 line echoes the resolved session index and label, so the transcript
 self-documents which device each action hit.
 
+## Acquire Sessions with `ensure`, Not Check-Then-Start
+
+Sessions die from idle timeouts while you work. Do not screenshot first and
+handle the error, and do not run `device list` then `device start` — both
+race against expiry. Acquire idempotently in one call and act on the result:
+
+```bash
+revyl device ensure --platform ios --label checkout --json
+# {"index":0,"platform":"ios","label":"checkout","session_id":"...","reused":true}
+```
+
+`ensure` reuses a matching healthy session, replaces a matching dead one, or
+starts a new one. Session-resolution errors also include the live roster
+inline (e.g. `no session at index 6. Active: 0=ios "checkout", 1=android`),
+so recover from the error text directly instead of running `device list`.
+
 ## Baseline Checks
 
 ```bash

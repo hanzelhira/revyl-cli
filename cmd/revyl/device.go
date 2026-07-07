@@ -495,10 +495,16 @@ func humanizeDeviceSessionResolveError(cmd *cobra.Command, err error) error {
 	msg := strings.TrimSpace(err.Error())
 	cmdPrefix := deviceCommandPrefix(cmd)
 
-	if strings.Contains(msg, "multiple sessions active") {
-		return fmt.Errorf("multiple sessions active. Specify -s <index|label> or run '%s device list' to see active sessions", cmdPrefix)
-	}
-
+	// Preserve any inline roster the manager included; only translate
+	// MCP-tool wording into CLI wording.
+	msg = strings.ReplaceAll(msg,
+		"Specify session_index or call list_device_sessions() to see them",
+		fmt.Sprintf("Specify -s <index|label> or run '%s device list' to see active sessions", cmdPrefix),
+	)
+	msg = strings.ReplaceAll(msg,
+		"Specify session_index",
+		"Specify -s <index|label>",
+	)
 	msg = strings.ReplaceAll(msg,
 		"Call list_device_sessions() to see active sessions",
 		fmt.Sprintf("Run '%s device list' to see active sessions", cmdPrefix),

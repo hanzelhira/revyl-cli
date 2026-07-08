@@ -1852,3 +1852,327 @@ func TestDeviceSessionManager_CancelStepBestEffort_BoundedByBudget(t *testing.T)
 		t.Fatalf("expected at least one post-cancel status poll, got %d", statusCalls)
 	}
 }
+
+func TestValidateSessionLabel(t *testing.T) {
+	cases := []struct {
+		label   string
+		wantErr string
+	}{
+		{"checkout-ios", ""},
+		{"a.b_c-1", ""},
+		{"", "must not be empty"},
+		{"   ", "must not be empty"},
+		{"42", "must not be a number"},
+		{"-1", "must not be a number"},
+		{"active", "reserved"},
+		{"Active", "reserved"},
+		{"has space", "may only contain"},
+		{"a,b", "may only contain"},
+	}
+	for _, tc := range cases {
+		err := ValidateSessionLabel(tc.label)
+		if tc.wantErr == "" {
+			if err != nil {
+				t.Errorf("ValidateSessionLabel(%q) unexpected error: %v", tc.label, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("ValidateSessionLabel(%q) = %v, want error containing %q", tc.label, err, tc.wantErr)
+		}
+	}
+}
+
+func newLabelTestManager() *DeviceSessionManager {
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   2,
+	}
+	mgr.sessions[0] = &DeviceSession{Index: 0, SessionID: "s0", Platform: "ios", Label: "checkout", StartedAt: now, LastActivity: now}
+	mgr.sessions[1] = &DeviceSession{Index: 1, SessionID: "s1", Platform: "android", StartedAt: now, LastActivity: now}
+	return mgr
+}
+
+func TestDeviceSessionManager_ResolveSessionRef(t *testing.T) {
+	mgr := newLabelTestManager()
+
+	cases := []struct {
+		ref     string
+		wantIdx int
+		wantErr string
+	}{
+		{"", 0, ""},         // active
+		{"active", 0, ""},   // keyword
+		{"Active", 0, ""},   // keyword, case-insensitive
+		{"-1", 0, ""},       // numeric active
+		{"1", 1, ""},        // index
+		{" 1 ", 1, ""},      // index with spaces
+		{"checkout", 0, ""}, // label
+		{"CHECKOUT", 0, ""}, // label, case-insensitive
+		{"9", -1, "no session at index 9"},
+		{"nope", -1, `no session labeled "nope"`},
+	}
+	for _, tc := range cases {
+		s, err := mgr.ResolveSessionRef(tc.ref)
+		if tc.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("ResolveSessionRef(%q) = %v, want error containing %q", tc.ref, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ResolveSessionRef(%q) unexpected error: %v", tc.ref, err)
+			continue
+		}
+		if s.Index != tc.wantIdx {
+			t.Errorf("ResolveSessionRef(%q) = index %d, want %d", tc.ref, s.Index, tc.wantIdx)
+		}
+	}
+
+	// Unknown-label error should list existing labels for recovery.
+	_, err := mgr.ResolveSessionRef("nope")
+	if err == nil || !strings.Contains(err.Error(), "checkout") {
+		t.Errorf("expected unknown-label error to list labels, got %v", err)
+	}
+}
+
+func TestDeviceSessionManager_SetSessionLabel(t *testing.T) {
+	mgr := newLabelTestManager()
+
+	if err := mgr.SetSessionLabel(1, "droid"); err != nil {
+		t.Fatalf("SetSessionLabel: %v", err)
+	}
+	if mgr.sessions[1].Label != "droid" {
+		t.Errorf("label not set: %+v", mgr.sessions[1])
+	}
+
+	// Duplicate (case-insensitive) rejected.
+	if err := mgr.SetSessionLabel(1, "CHECKOUT"); err == nil || !strings.Contains(err.Error(), "already used by session 0") {
+		t.Errorf("expected duplicate rejection, got %v", err)
+	}
+
+	// Re-labeling the same session to its own label is fine.
+	if err := mgr.SetSessionLabel(0, "checkout"); err != nil {
+		t.Errorf("re-label same session: %v", err)
+	}
+
+	// Invalid label rejected.
+	if err := mgr.SetSessionLabel(1, "99"); err == nil {
+		t.Error("expected numeric label rejection")
+	}
+
+	// Clear.
+	if err := mgr.SetSessionLabel(0, ""); err != nil {
+		t.Fatalf("clear label: %v", err)
+	}
+	if mgr.sessions[0].Label != "" {
+		t.Errorf("label not cleared: %+v", mgr.sessions[0])
+	}
+
+	// Unknown index.
+	if err := mgr.SetSessionLabel(9, "x"); err == nil {
+		t.Error("expected error for unknown index")
+	}
+}
+
+func TestDeviceSessionManager_LabelPersistsAcrossReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	now := time.Now()
+
+	mgr := &DeviceSessionManager{
+		workDir:     tmpDir,
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   1,
+	}
+	mgr.sessions[0] = &DeviceSession{Index: 0, SessionID: "s0", Platform: "ios", StartedAt: now, LastActivity: now}
+	if err := mgr.SetSessionLabel(0, "checkout"); err != nil {
+		t.Fatalf("SetSessionLabel: %v", err)
+	}
+
+	mgr2 := &DeviceSessionManager{
+		workDir:     tmpDir,
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: -1,
+	}
+	mgr2.loadLocalCache()
+
+	if s, err := mgr2.ResolveSessionRef("checkout"); err != nil || s.Index != 0 {
+		t.Fatalf("label did not survive reload: session=%+v err=%v", s, err)
+	}
+}
+
+func TestDeviceSessionManager_SyncSessions_PreservesLabel(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/entity/users/get_user_uuid":
+			_, _ = w.Write([]byte(`{"user_id":"u1","org_id":"org-1","email":"me@example.com","concurrency_limit":10}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/execution/device-sessions/active"):
+			_, _ = w.Write([]byte(`{"sessions":[{
+				"id":"backend-sess-1",
+				"org_id":"org-1",
+				"platform":"ios",
+				"status":"running",
+				"source":"cli",
+				"user_email":"me@example.com",
+				"workflow_run_id":"wf-1",
+				"app_package":null,"created_at":"2026-07-06T00:00:00Z","device_model":null,
+				"idle_timeout_seconds":300,"interaction_disabled_reason":null,
+				"last_activity_at":null,"os_version":null,"screen_height":null,
+				"screen_width":null,"source_metadata":null,"started_at":null,
+				"test_id":null,"test_name":null,"trace_id":null,"user_email":"me@example.com"
+			}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   1,
+	}
+	mgr.sessions[0] = &DeviceSession{
+		Index: 0, SessionID: "backend-sess-1", WorkflowRunID: "wf-1",
+		WorkerBaseURL: "http://localhost:1", Platform: "ios", Label: "checkout",
+		StartedAt: now, LastActivity: now,
+	}
+
+	if err := mgr.SyncSessions(context.Background()); err != nil {
+		t.Fatalf("SyncSessions: %v", err)
+	}
+
+	s, err := mgr.ResolveSessionRef("checkout")
+	if err != nil {
+		t.Fatalf("label lost after sync: %v", err)
+	}
+	if s.SessionID != "backend-sess-1" {
+		t.Fatalf("unexpected session after sync: %+v", s)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestDeviceSessionManager_SyncSessions_GracePeriodForPendingSessionID:
+// A freshly committed session whose backend session ID hasn't materialized
+// yet (empty SessionID) must survive a sync instead of being pruned; a stale
+// one without an ID is still cleaned up.
+// ---------------------------------------------------------------------------
+
+func TestDeviceSessionManager_SyncSessions_GracePeriodForPendingSessionID(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/entity/users/get_user_uuid":
+			_, _ = w.Write([]byte(`{"user_id":"u1","org_id":"org-1","email":"me@example.com","concurrency_limit":10}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/execution/device-sessions/active"):
+			// Backend list is lagging: reports no sessions at all.
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   2,
+	}
+	// Young session, ID still pending: must survive.
+	mgr.sessions[0] = &DeviceSession{
+		Index: 0, SessionID: "", WorkflowRunID: "wf-young", Label: "web-c",
+		WorkerBaseURL: "http://localhost:1", Platform: "ios",
+		StartedAt: now.Add(-10 * time.Second), LastActivity: now,
+	}
+	// Stale session without an ID: pruned as before.
+	mgr.sessions[1] = &DeviceSession{
+		Index: 1, SessionID: "", WorkflowRunID: "wf-old",
+		WorkerBaseURL: "http://localhost:1", Platform: "ios",
+		StartedAt: now.Add(-10 * time.Minute), LastActivity: now.Add(-10 * time.Minute),
+	}
+
+	if err := mgr.SyncSessions(context.Background()); err != nil {
+		t.Fatalf("SyncSessions: %v", err)
+	}
+
+	if _, ok := mgr.sessions[0]; !ok {
+		t.Fatal("young pending-ID session was pruned; grace period not applied")
+	}
+	if s, err := mgr.ResolveSessionRef("web-c"); err != nil || s.Index != 0 {
+		t.Fatalf("label lost on pending-ID session: %+v err=%v", s, err)
+	}
+	if _, ok := mgr.sessions[1]; ok {
+		t.Fatal("stale pending-ID session should still be pruned")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestDeviceSessionManager_SyncSessions_RecentActivitySurvivesEmptyBackend:
+// A transient empty/partial backend list must not prune a session that
+// completed a worker call moments ago; stale sessions are still pruned.
+// ---------------------------------------------------------------------------
+
+func TestDeviceSessionManager_SyncSessions_RecentActivitySurvivesEmptyBackend(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/entity/users/get_user_uuid":
+			_, _ = w.Write([]byte(`{"user_id":"u1","org_id":"org-1","email":"me@example.com","concurrency_limit":10}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/execution/device-sessions/active"):
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	now := time.Now()
+	mgr := &DeviceSessionManager{
+		apiClient:   api.NewClientWithBaseURL("test-key", server.URL),
+		sessions:    make(map[int]*DeviceSession),
+		idleTimers:  make(map[int]*time.Timer),
+		activeIndex: 0,
+		nextIndex:   2,
+	}
+	// Active seconds ago: survives the flaky backend response.
+	mgr.sessions[0] = &DeviceSession{
+		Index: 0, SessionID: "live-1", WorkflowRunID: "wf-1", Platform: "ios",
+		WorkerBaseURL: "http://localhost:1",
+		StartedAt:     now.Add(-10 * time.Minute), LastActivity: now.Add(-5 * time.Second),
+	}
+	// Idle for 10 minutes and not on the backend: pruned.
+	mgr.sessions[1] = &DeviceSession{
+		Index: 1, SessionID: "stale-1", WorkflowRunID: "wf-2", Platform: "ios",
+		WorkerBaseURL: "http://localhost:1",
+		StartedAt:     now.Add(-30 * time.Minute), LastActivity: now.Add(-10 * time.Minute),
+	}
+
+	if err := mgr.SyncSessions(context.Background()); err != nil {
+		t.Fatalf("SyncSessions: %v", err)
+	}
+	if _, ok := mgr.sessions[0]; !ok {
+		t.Fatal("recently active session was pruned by empty backend response")
+	}
+	if _, ok := mgr.sessions[1]; ok {
+		t.Fatal("stale session should have been pruned")
+	}
+}

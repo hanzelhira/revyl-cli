@@ -86,7 +86,7 @@ func TestHumanizeDeviceSessionResolveError_MultipleSessions(t *testing.T) {
 		t.Fatal("humanizeDeviceSessionResolveError() error = nil, want non-nil")
 	}
 	got := err.Error()
-	if !strings.Contains(got, "Specify -s <index> or run 'revyl device list' to see active sessions") {
+	if !strings.Contains(got, "Specify -s <index|label> or run 'revyl device list' to see active sessions") {
 		t.Fatalf("error = %q, want CLI multi-session guidance", got)
 	}
 	if strings.Contains(got, "session_index") || strings.Contains(got, "list_device_sessions()") {

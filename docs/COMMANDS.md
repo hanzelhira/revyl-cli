@@ -216,6 +216,23 @@ revyl device start --platform ios
 # Want hot reload? Run: revyl dev attach active
 ```
 
+Sessions and labels (recommended for coding agents -- name sessions so they
+survive context and address them by label instead of a fragile index):
+
+```bash
+revyl device ensure --platform ios --label checkout --json  # reuse-or-start, idempotent
+revyl device label 0 logged-in                              # label a running session
+revyl device list --json                                    # indices, labels, state
+revyl device screenshot -s checkout                         # address by label anywhere -s takes an index
+```
+
+`revyl device ensure` returns a live session matching `--label`/`--platform`,
+reusing a healthy one, replacing a dead one, or starting a new one -- use it
+instead of check-then-start, which races with idle timeouts. When a session
+is missing, resolution errors include the live roster inline (e.g.
+`no session at index 6. Active: 0=ios "checkout"`), and with multiple
+sessions active a bare device command warns which session it targeted.
+
 ### Builds and Dev Mode
 
 All `revyl build` and `revyl build upload` commands push to a shared app container (the `app_id` in your config). Each upload is tagged with your git branch and commit via metadata.

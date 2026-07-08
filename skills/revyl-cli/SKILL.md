@@ -27,6 +27,40 @@ Use this as the default Revyl skill when workflows should be expressed as `revyl
 1. Prefer explicit command sequences.
 2. Keep secrets in env vars or test variables.
 3. Keep steps deterministic and avoid hidden assumptions.
+4. With multiple sessions, address each by label, not index, and pass
+   `--json` on device commands for compact output.
+
+## Multiple Sessions: Label Everything
+
+Give each session a label naming its purpose, and use labels (not indices)
+everywhere a session is addressed — `-s`, `device use` — so scripts stay
+readable and survive context churn instead of breaking on a stale index:
+
+```bash
+revyl device start --platform ios --label checkout-ios --json
+revyl device label 0 logged-in        # label a session after the fact
+revyl device list --json              # indices, labels, and state
+revyl device screenshot -s checkout-ios
+```
+
+With more than one session active, a bare device command warns which session
+it targeted, so a wrong-session action surfaces instead of passing silently.
+
+## Acquire Sessions with `ensure`, Not Check-Then-Start
+
+Sessions die from idle timeouts while you work. Do not screenshot first and
+handle the error, and do not run `device list` then `device start` — both
+race against expiry. Acquire idempotently in one call and act on the result:
+
+```bash
+revyl device ensure --platform ios --label checkout --json
+# {"index":0,"platform":"ios","label":"checkout","session_id":"...","reused":true}
+```
+
+`ensure` reuses a matching healthy session, replaces a matching dead one, or
+starts a new one. Session-resolution errors also include the live roster
+inline (e.g. `no session at index 6. Active: 0=ios "checkout", 1=android`),
+so recover from the error text directly instead of running `device list`.
 
 ## Baseline Checks
 

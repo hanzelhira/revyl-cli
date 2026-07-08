@@ -89,6 +89,15 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+// silenceUsageTree disables cobra's print-usage-on-error for a command and
+// all its descendants.
+func silenceUsageTree(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	for _, c := range cmd.Commands() {
+		silenceUsageTree(c)
+	}
+}
+
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 //
@@ -96,6 +105,11 @@ var rootCmd = &cobra.Command{
 // commands in the wrong order (e.g., "revyl open test" instead of "revyl test open").
 func Execute() {
 	installAnalytics(rootCmd)
+
+	// Runtime failures on device commands are not usage mistakes; the
+	// ~400-char usage dump is pure noise for the agents that dominate this
+	// command tree (and telemetry shows ~10k device-command failures/month).
+	silenceUsageTree(deviceCmd)
 
 	err := rootCmd.Execute()
 	if err != nil {
